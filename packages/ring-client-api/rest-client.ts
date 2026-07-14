@@ -10,6 +10,7 @@ import {
 } from './util.ts'
 import type {
   Auth2faResponse,
+  Auth2faVerifyResponse,
   AuthTokenResponse,
   SessionResponse,
 } from './ring-types.ts'
@@ -17,6 +18,8 @@ import { ReplaySubject } from 'rxjs'
 import assert from 'assert'
 import type { Credentials } from '@eneris/push-receiver/dist/types.d.js'
 import { Agent } from 'undici'
+import { randomBytes, createHash } from 'crypto'
+import { CookieJar } from 'tough-cookie'
 
 interface RequestOptions extends RequestInit {
   responseType?: 'json' | 'buffer'
@@ -46,7 +49,68 @@ const fetchAgent = new Agent({
   deviceApiBaseUrl = 'https://api.ring.com/devices/v1/',
   commandsApiBaseUrl = 'https://api.ring.com/commands/v1/',
   appApiBaseUrl = 'https://prd-api-us.prd.rings.solutions/api/v1/',
-  apiVersion = 11
+  oauthBaseUrl = 'https://oauth.ring.com',
+  apiVersion = 11,
+  oauthRedirectOrigins = new Set([
+    'https://oauth.ring.com',
+    'https://ring.com',
+  ]),
+  oauthUserAgent = 'android:com.ringapp',
+  oauthRequestTimeout = 20000,
+  maxOauthRedirects = 5
+
+function generateCodeVerifier() {
+  return randomBytes(32).toString('base64url')
+}
+
+function generateCodeChallenge(codeVerifier: string) {
+  return createHash('sha256').update(codeVerifier).digest('base64url')
+}
+
+function generateState() {
+  return randomBytes(16).toString('hex')
+}
+
+function resolveOauthUrl(location: string, currentUrl: string): URL {
+  const nextUrl = new URL(location, currentUrl)
+  if (!oauthRedirectOrigins.has(nextUrl.origin)) {
+    throw new Error('Refusing Ring OAuth redirect to an untrusted origin')
+  }
+
+  return nextUrl
+}
+
+async function storeResponseCookies(
+  cookieJar: CookieJar,
+  response: Response,
+  requestUrl: string,
+) {
+  for (const cookie of response.headers.getSetCookie()) {
+    await cookieJar.setCookie(cookie, requestUrl)
+  }
+}
+
+async function oauthHeaders(
+  cookieJar: CookieJar,
+  requestUrl: string,
+  additionalHeaders: Record<string, string> = {},
+) {
+  const cookie = await cookieJar.getCookieString(requestUrl)
+
+  return {
+    'User-Agent': oauthUserAgent,
+    ...additionalHeaders,
+    ...(cookie ? { Cookie: cookie } : {}),
+  }
+}
+
+interface PendingPkceState {
+  codeVerifier: string
+  state: string
+  csrfToken: string
+  cookieJar: CookieJar
+  redirectUri: string
+}
 
 export function clientApi(path: string) {
   return clientApiBaseUrl + path
@@ -94,6 +158,60 @@ async function responseToError(response: Response) {
   }
 
   return error
+}
+
+function isAuthTokenResponse(value: unknown): value is AuthTokenResponse {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const token = value as Partial<AuthTokenResponse>
+  return (
+    typeof token.access_token === 'string' &&
+    token.access_token.length > 0 &&
+    typeof token.refresh_token === 'string' &&
+    token.refresh_token.length > 0
+  )
+}
+
+function oauthErrorSummary(error: unknown) {
+  const response = (error as Partial<ResponseError>)?.response
+  if (response && typeof response.status === 'number') {
+    const body = response.body,
+      errorCode =
+        body &&
+        typeof body === 'object' &&
+        typeof body.error === 'string' &&
+        /^[a-z0-9_.-]{1,64}$/i.test(body.error)
+          ? body.error
+          : undefined
+    return `status ${response.status}${errorCode ? `, error ${errorCode}` : ''}`
+  }
+
+  if (error instanceof Error) {
+    const safeMessagePrefixes = [
+      'Refusing Ring OAuth redirect',
+      'State mismatch in OAuth response',
+      'Unable to extract CSRF token',
+      'Ring OAuth ',
+      'Ring sign-in ',
+      'No pending PKCE flow',
+      '2FA verification failed',
+      'Verification Code is invalid or expired',
+      'No location header',
+      'Expected redirect from authorize',
+      'Failed to get authorization code',
+    ]
+    if (
+      safeMessagePrefixes.some((prefix) => error.message.startsWith(prefix))
+    ) {
+      return error.message
+    }
+
+    return error.name
+  }
+
+  return 'unknown OAuth error'
 }
 
 async function requestWithRetry<T>(
@@ -291,131 +409,508 @@ export class RingRestClient {
     }
   }
 
-  private getGrantData(twoFactorAuthCode?: string) {
-    if (this.authConfig?.rt && !twoFactorAuthCode) {
-      return {
-        grant_type: 'refresh_token',
-        refresh_token: this.authConfig.rt,
+  private pendingPkceState?: PendingPkceState
+
+  private async extractCsrfToken(html: string, cookieJar: CookieJar) {
+    const csrfCookieNames = new Set([
+      'csrf-token',
+      'csrfToken',
+      'csrf_token',
+      '_csrf',
+      'XSRF-TOKEN',
+    ])
+    for (const cookie of await cookieJar.getCookies(oauthBaseUrl)) {
+      if (csrfCookieNames.has(cookie.key) && cookie.value) {
+        return cookie.value
       }
     }
 
-    const { authOptions } = this
-    if ('email' in authOptions) {
-      return {
-        grant_type: 'password',
-        password: authOptions.password,
-        username: authOptions.email,
+    // Ring has used both ids for JSON bootstrap data across auth page versions.
+    for (const scriptId of ['__NEXT_DATA__', 'oauth-args']) {
+      const escapedId = scriptId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+        scriptMatch = html.match(
+          new RegExp(
+            `<script[^>]*id=["']${escapedId}["'][^>]*>(.*?)<\\/script>`,
+            's',
+          ),
+        )
+      if (!scriptMatch) {
+        continue
       }
+
+      try {
+        const csrfToken = this.findCsrfInObject(JSON.parse(scriptMatch[1]))
+        if (csrfToken) return csrfToken
+      } catch {
+        // Continue with the non-JSON fallbacks below.
+      }
+    }
+
+    // Try hidden input field (various name patterns)
+    const inputMatch =
+      html.match(/name="csrf-token"[^>]*value="([^"]+)"/) ||
+      html.match(/value="([^"]+)"[^>]*name="csrf-token"/) ||
+      html.match(/name="csrfToken"[^>]*value="([^"]+)"/) ||
+      html.match(/value="([^"]+)"[^>]*name="csrfToken"/) ||
+      html.match(/name="_csrf"[^>]*value="([^"]+)"/) ||
+      html.match(/value="([^"]+)"[^>]*name="_csrf"/)
+    if (inputMatch) return inputMatch[1]
+
+    // Try meta tag
+    const metaMatch =
+      html.match(/meta[^>]*name="csrf-token"[^>]*content="([^"]+)"/) ||
+      html.match(/meta[^>]*name="csrfToken"[^>]*content="([^"]+)"/)
+    if (metaMatch) return metaMatch[1]
+
+    // Try any JavaScript variable assignment that looks like a CSRF token
+    const jsMatch = html.match(
+      /["']csrf[-_]?[Tt]oken["']\s*[=:]\s*["']([^"']+)["']/,
+    )
+    if (jsMatch) return jsMatch[1]
+
+    throw new Error('Unable to extract CSRF token from Ring OAuth page')
+  }
+
+  private findCsrfInObject(obj: unknown, depth = 0): string | undefined {
+    if (!obj || typeof obj !== 'object' || depth > 5) return undefined
+    const record = obj as Record<string, unknown>
+    for (const key of Object.keys(record)) {
+      const lowerKey = key.toLowerCase()
+      if (
+        (lowerKey === 'csrftoken' ||
+          lowerKey === 'csrf' ||
+          lowerKey === 'csrf-token' ||
+          lowerKey === 'csrf_token') &&
+        typeof record[key] === 'string'
+      ) {
+        return record[key]
+      }
+      const found = this.findCsrfInObject(record[key], depth + 1)
+      if (found) return found
+    }
+    return undefined
+  }
+
+  private async initiatePkceFlow(): Promise<void> {
+    const codeVerifier = generateCodeVerifier(),
+      codeChallenge = generateCodeChallenge(codeVerifier),
+      state = generateState(),
+      hardwareId = await this.hardwareIdPromise,
+      redirectUri = 'https://ring.com/signin/callback',
+      cookieJar = new CookieJar(),
+      params = new URLSearchParams({
+        redirect_uri: redirectUri,
+        client_id: 'ring_official_android',
+        response_type: 'code',
+        prompt: 'login',
+        state,
+        scope: 'client',
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+        device_model: 'ring-client-api',
+        app_version: '3.102.0',
+        dark_mode: 'false',
+        device_brand: 'nodejs',
+        device_os_version: process.version,
+        app_brand: 'ring',
+        hardware_id: hardwareId,
+      })
+
+    // Follow redirects manually so cookies remain scoped to their real host/path.
+    let currentUrl = new URL(`${oauthBaseUrl}/oauth/v2/authorize?${params}`),
+      html = ''
+
+    for (let i = 0; i < maxOauthRedirects; i++) {
+      const requestUrl = currentUrl.toString(),
+        options = {
+          method: 'GET',
+          redirect: 'manual' as const,
+          headers: await oauthHeaders(cookieJar, requestUrl, {
+            Accept: 'text/html,application/xhtml+xml,application/json',
+          }),
+          dispatcher: fetchAgent,
+          signal: AbortSignal.timeout(oauthRequestTimeout),
+        },
+        response = await fetch(requestUrl, options)
+      await storeResponseCookies(cookieJar, response, requestUrl)
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location')
+        if (!location) {
+          throw new Error('Ring OAuth redirect did not include a location')
+        }
+        currentUrl = resolveOauthUrl(location, requestUrl)
+        continue
+      }
+
+      if (!response.ok) {
+        throw new Error(`Ring OAuth sign-in page returned ${response.status}`)
+      }
+
+      html = await response.text()
+      break
+    }
+
+    if (!html) {
+      throw new Error('Ring OAuth redirect limit exceeded')
+    }
+
+    const csrfToken = await this.extractCsrfToken(html, cookieJar)
+    logDebug('Ring OAuth sign-in session initialized')
+
+    this.pendingPkceState = {
+      codeVerifier,
+      state,
+      csrfToken,
+      cookieJar,
+      redirectUri,
+    }
+  }
+
+  private async submitCredentials(): Promise<void> {
+    const { authOptions } = this
+    if (!('email' in authOptions) || !this.pendingPkceState) {
+      throw new Error('No pending PKCE flow or email credentials')
+    }
+
+    const { csrfToken, cookieJar } = this.pendingPkceState,
+      body = new URLSearchParams({
+        username: authOptions.email,
+        password: authOptions.password,
+        'csrf-token': csrfToken,
+      }),
+      requestUrl = `${oauthBaseUrl}/oauth/v2/signin`,
+      signinPostOptions = {
+        method: 'POST',
+        redirect: 'manual' as const,
+        headers: await oauthHeaders(cookieJar, requestUrl, {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json,text/html',
+          Origin: oauthBaseUrl,
+          Referer: `${oauthBaseUrl}/oauth/v2/signin`,
+        }),
+        body: body.toString(),
+        dispatcher: fetchAgent,
+        signal: AbortSignal.timeout(oauthRequestTimeout),
+      },
+      response = await fetch(requestUrl, signinPostOptions)
+
+    await storeResponseCookies(cookieJar, response, requestUrl)
+    logDebug(`Ring OAuth credential response status: ${response.status}`)
+
+    if (response.status === 412) {
+      // 2FA required
+      const responseData = (await response
+        .json()
+        .catch(() => ({}))) as Auth2faResponse
+      this.using2fa = true
+
+      if ('tsv_state' in responseData) {
+        const { tsv_state, phone } = responseData,
+          prompt =
+            tsv_state === 'totp'
+              ? 'from your authenticator app'
+              : `sent to ${phone} via ${tsv_state}`
+
+        this.promptFor2fa = `Please enter the code ${prompt}`
+      } else {
+        this.promptFor2fa = 'Please enter the code sent to your text/email'
+      }
+
+      throw new Error(
+        'Your Ring account is configured to use 2-factor authentication (2fa).  See https://github.com/dgreif/ring/wiki/Refresh-Tokens for details.',
+      )
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location')
+      if (location) {
+        resolveOauthUrl(location, requestUrl)
+      }
+      return
+    }
+
+    if (!response.ok) {
+      throw new Error(`Ring sign-in rejected credentials (${response.status})`)
+    }
+  }
+
+  private async verify2fa(code: string): Promise<void> {
+    if (!this.pendingPkceState) {
+      throw new Error('No pending PKCE flow state for 2FA verification')
+    }
+
+    const { csrfToken, cookieJar } = this.pendingPkceState,
+      body = new URLSearchParams({
+        '2fa_code': code,
+        'csrf-token': csrfToken,
+        remember_me: 'false',
+      }),
+      requestUrl = `${oauthBaseUrl}/oauth/v2/2fa/verify`,
+      verifyOptions = {
+        method: 'POST',
+        headers: await oauthHeaders(cookieJar, requestUrl, {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+          Origin: oauthBaseUrl,
+          Referer: `${oauthBaseUrl}/oauth/v2/signin`,
+        }),
+        body: body.toString(),
+        dispatcher: fetchAgent,
+        signal: AbortSignal.timeout(oauthRequestTimeout),
+      },
+      response = await fetch(requestUrl, verifyOptions)
+
+    await storeResponseCookies(cookieJar, response, requestUrl)
+
+    logDebug(`Ring OAuth 2FA response status: ${response.status}`)
+
+    if (response.status === 400 || response.status === 401) {
+      this.promptFor2fa = 'Invalid 2fa code entered.  Please try again.'
+      throw new Error('Verification Code is invalid or expired')
+    }
+
+    if (response.status !== 200 && response.status !== 201) {
+      throw new Error(`2FA verification failed with status ${response.status}`)
+    }
+
+    const verifyBody = (await response
+      .json()
+      .catch(() => ({}))) as Partial<Auth2faVerifyResponse>
+    if (verifyBody.redirect_url) {
+      resolveOauthUrl(verifyBody.redirect_url, requestUrl)
+    }
+    logDebug('Ring OAuth 2FA verification succeeded')
+  }
+
+  private async getAuthorizationCode(): Promise<string> {
+    if (!this.pendingPkceState) {
+      throw new Error('No pending PKCE flow state')
+    }
+
+    const { state, cookieJar } = this.pendingPkceState
+
+    // After 2FA, the server remembers the original authorize params from the session.
+    // We just need to revisit /oauth/v2/authorize with the session cookies.
+    let authorizeUrl = new URL(`${oauthBaseUrl}/oauth/v2/authorize`)
+
+    // Follow redirects manually to find the one with the authorization code
+    for (let i = 0; i < maxOauthRedirects; i++) {
+      const requestUrl = authorizeUrl.toString(),
+        reqOptions = {
+          method: 'GET',
+          redirect: 'manual' as const,
+          headers: await oauthHeaders(cookieJar, requestUrl, {
+            Accept: 'text/html,application/xhtml+xml,application/json',
+          }),
+          dispatcher: fetchAgent,
+          signal: AbortSignal.timeout(oauthRequestTimeout),
+        },
+        response = await fetch(requestUrl, reqOptions)
+      await storeResponseCookies(cookieJar, response, requestUrl)
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location')
+
+        if (!location) {
+          throw new Error('No location header in authorize redirect')
+        }
+
+        const redirectUrl = resolveOauthUrl(location, requestUrl),
+          code = redirectUrl.searchParams.get('code'),
+          returnedState = redirectUrl.searchParams.get('state')
+
+        if (code) {
+          if (returnedState !== state) {
+            throw new Error('State mismatch in OAuth response')
+          }
+          return code
+        }
+
+        // No code yet — follow this redirect
+        authorizeUrl = redirectUrl
+        continue
+      }
+
+      throw new Error(
+        `Expected redirect from authorize but got ${response.status}`,
+      )
     }
 
     throw new Error(
-      'Refresh token is not valid.  Unable to authenticate with Ring servers.  See https://github.com/dgreif/ring/wiki/Refresh-Tokens',
+      'Failed to get authorization code after following redirects',
     )
   }
 
-  async getAuth(twoFactorAuthCode?: string): Promise<AuthTokenResponse> {
-    const grantData = this.getGrantData(twoFactorAuthCode)
+  private async exchangeCodeForTokens(
+    code: string,
+  ): Promise<AuthTokenResponse> {
+    if (!this.pendingPkceState) {
+      throw new Error('No pending PKCE flow state')
+    }
 
-    try {
-      const hardwareId = await this.hardwareIdPromise,
-        response = await requestWithRetry<AuthTokenResponse>({
-          url: 'https://oauth.ring.com/oauth/token',
-          json: {
-            client_id: 'ring_official_android',
-            scope: 'client',
-            ...grantData,
-          },
-          method: 'POST',
-          headers: {
-            '2fa-support': 'true',
-            '2fa-code': twoFactorAuthCode || '',
-            hardware_id: hardwareId,
-            'User-Agent': 'android:com.ringapp',
-          },
-        }),
-        oldRefreshToken = this.refreshToken
+    const { codeVerifier, redirectUri } = this.pendingPkceState,
+      hardwareId = await this.hardwareIdPromise,
+      body = new URLSearchParams({
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+        client_id: 'ring_official_android',
+      }),
+      tokenOptions = {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+          'User-Agent': oauthUserAgent,
+          hardware_id: hardwareId,
+        },
+        body: body.toString(),
+        dispatcher: fetchAgent,
+        signal: AbortSignal.timeout(oauthRequestTimeout),
+      },
+      response = await fetch(`${oauthBaseUrl}/oauth/token`, tokenOptions)
 
-      // Store the new refresh token and auth config
-      this.authConfig = {
-        ...this.authConfig,
-        rt: response.refresh_token,
-        hid: hardwareId,
-      }
-      this.refreshToken = toBase64(JSON.stringify(this.authConfig))
+    if (!response.ok) {
+      const error = await responseToError(response)
+      throw error
+    }
 
-      // Emit an event with the new token
-      this.onRefreshTokenUpdated.next({
-        oldRefreshToken,
-        newRefreshToken: this.refreshToken,
+    const tokenResponse: unknown = await response.json()
+    if (!isAuthTokenResponse(tokenResponse)) {
+      throw new Error('Ring OAuth token response was incomplete')
+    }
+
+    // Clean up PKCE state
+    this.pendingPkceState = undefined
+
+    return tokenResponse
+  }
+
+  private async refreshWithToken(): Promise<AuthTokenResponse> {
+    const hardwareId = await this.hardwareIdPromise,
+      body = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: this.authConfig!.rt,
+        client_id: 'ring_official_android',
+        scope: 'client',
+      }),
+      response: unknown = await requestWithRetry<unknown>({
+        url: `${oauthBaseUrl}/oauth/token`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+          'User-Agent': oauthUserAgent,
+          hardware_id: hardwareId,
+        },
+        body: body.toString(),
       })
 
-      return {
-        ...response,
-        // Override the refresh token in the response so that consumers of this data get the wrapped version
-        refresh_token: this.refreshToken,
-      }
-    } catch (requestError: any) {
-      if (grantData.refresh_token) {
-        // failed request with refresh token
-        this.refreshToken = undefined
-        this.authConfig = undefined
-        logError(requestError)
-        return this.getAuth()
-      }
+    if (!isAuthTokenResponse(response)) {
+      throw new Error('Ring OAuth refresh response was incomplete')
+    }
 
-      const response = requestError.response || {},
-        responseData: Auth2faResponse = response.body || {},
-        responseError =
-          'error' in responseData && typeof responseData.error === 'string'
-            ? responseData.error
-            : ''
+    return response
+  }
 
-      if (
-        response.status === 412 || // need 2fa code
-        (response.status === 400 &&
-          responseError.startsWith('Verification Code')) // invalid 2fa code entered
-      ) {
-        this.using2fa = true
+  private async authenticateWithPkce(
+    twoFactorAuthCode?: string,
+  ): Promise<AuthTokenResponse> {
+    // Track whether we've passed the 2FA stage so we can distinguish
+    // "need 2FA code" errors from post-2FA errors
+    let past2fa = false
 
-        if (response.status === 400) {
-          this.promptFor2fa = 'Invalid 2fa code entered.  Please try again.'
-          throw new Error(responseError, { cause: requestError })
-        }
-
-        if ('tsv_state' in responseData) {
-          const { tsv_state, phone } = responseData,
-            prompt =
-              tsv_state === 'totp'
-                ? 'from your authenticator app'
-                : `sent to ${phone} via ${tsv_state}`
-
-          this.promptFor2fa = `Please enter the code ${prompt}`
-        } else {
-          this.promptFor2fa = 'Please enter the code sent to your text/email'
-        }
-
-        throw new Error(
-          'Your Ring account is configured to use 2-factor authentication (2fa).  See https://github.com/dgreif/ring/wiki/Refresh-Tokens for details.',
-          { cause: requestError },
-        )
+    try {
+      if (twoFactorAuthCode && this.pendingPkceState) {
+        // We have a 2FA code and an existing PKCE session — verify and continue
+        await this.verify2fa(twoFactorAuthCode)
+        past2fa = true
+      } else {
+        // Start fresh PKCE flow
+        await this.initiatePkceFlow()
+        await this.submitCredentials()
+        // If we reach here without throwing, no 2FA was needed
+        past2fa = true
       }
 
+      // Get the authorization code via redirect
+      logDebug('Getting authorization code...')
+      const code = await this.getAuthorizationCode()
+
+      // Exchange code for tokens
+      logDebug('Exchanging code for tokens...')
+      const tokenResponse = await this.exchangeCodeForTokens(code)
+      this.using2fa = false
+      this.promptFor2fa = undefined
+      return tokenResponse
+    } catch (error: any) {
+      // Re-throw 2FA prompt errors as-is (only when we haven't passed 2FA yet)
+      if (this.using2fa && this.promptFor2fa && !past2fa) {
+        throw error
+      }
+
+      this.pendingPkceState = undefined
       const authTypeMessage =
           'refreshToken' in this.authOptions
             ? 'refresh token is'
             : 'email and password are',
         errorMessage =
-          'Failed to fetch oauth token from Ring. ' +
-          ('error_description' in responseData &&
-          responseData.error_description ===
-            'too many requests from dependency service'
-            ? 'You have requested too many 2fa codes.  Ring limits 2fa to 10 codes within 10 minutes.  Please try again in 10 minutes.'
-            : `Verify that your ${authTypeMessage} correct.`) +
-          ` (error: ${responseError})`
-      logError(requestError.response || requestError)
+          `Failed to fetch oauth token from Ring. Verify that your ${authTypeMessage} correct.` +
+          ` (${oauthErrorSummary(error)})`
       logError(errorMessage)
-      throw new Error(errorMessage, { cause: requestError })
+      throw new Error(errorMessage, { cause: error })
     }
+  }
+
+  private async updateTokens(response: AuthTokenResponse) {
+    const oldRefreshToken = this.refreshToken,
+      hardwareId = await this.hardwareIdPromise
+
+    this.authConfig = {
+      ...this.authConfig,
+      rt: response.refresh_token,
+      hid: hardwareId,
+    }
+    this.refreshToken = toBase64(JSON.stringify(this.authConfig))
+
+    this.onRefreshTokenUpdated.next({
+      oldRefreshToken,
+      newRefreshToken: this.refreshToken,
+    })
+
+    return {
+      ...response,
+      refresh_token: this.refreshToken,
+    }
+  }
+
+  async getAuth(twoFactorAuthCode?: string): Promise<AuthTokenResponse> {
+    // If we have a refresh token and no 2FA code, use refresh flow
+    if (this.authConfig?.rt && !twoFactorAuthCode) {
+      try {
+        const response = await this.refreshWithToken()
+        return this.updateTokens(response)
+      } catch (e) {
+        // Refresh token failed — clear it and try email/password if available
+        this.refreshToken = undefined
+        this.authConfig = undefined
+        logError(`Ring OAuth refresh failed (${oauthErrorSummary(e)})`)
+        return this.getAuth()
+      }
+    }
+
+    // Email/password auth via PKCE
+    const { authOptions } = this
+    if ('email' in authOptions) {
+      const response = await this.authenticateWithPkce(twoFactorAuthCode)
+      return this.updateTokens(response)
+    }
+
+    throw new Error(
+      'Refresh token is not valid.  Unable to authenticate with Ring servers.  See https://github.com/dgreif/ring/wiki/Refresh-Tokens',
+    )
   }
 
   private async fetchNewSession(authToken: AuthTokenResponse) {

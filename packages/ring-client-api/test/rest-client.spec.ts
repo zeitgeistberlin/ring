@@ -177,7 +177,10 @@ const email = 'some@one.com',
       async ({ request: req }) => {
         if (
           req.headers.get('User-Agent') !== 'android:com.ringapp' ||
-          req.headers.get('hardware_id') !== (await hardwareIdPromise)
+          req.headers.get('hardware_id') !== (await hardwareIdPromise) ||
+          !req.headers
+            .get('Content-Type')
+            ?.startsWith('application/x-www-form-urlencoded')
         ) {
           return HttpResponse.json(
             {
@@ -466,6 +469,58 @@ describe('getAuth', () => {
     expect(storedCodeChallenge).toBeTruthy()
   })
 
+  it('should extract the CSRF token from the oauth-args bootstrap script', async () => {
+    server.use(
+      http.get('https://oauth.ring.com/oauth/v2/signin', () =>
+        HttpResponse.html(
+          `<script id="oauth-args" type="application/json">{"csrf-token":"${csrfToken}"}</script>`,
+        ),
+      ),
+    )
+
+    client = new RingRestClient({ password, email })
+
+    await expect(() => client.getAuth()).rejects.toThrow(
+      'Your Ring account is configured to use 2-factor authentication',
+    )
+  })
+
+  it('should complete PKCE when the account does not require 2fa', async () => {
+    server.use(
+      http.post(
+        'https://oauth.ring.com/oauth/v2/signin',
+        async ({ request: req }) => {
+          const params = new URLSearchParams(await req.text())
+          if (
+            params.get('username') !== email ||
+            params.get('password') !== password ||
+            params.get('csrf-token') !== csrfToken
+          ) {
+            return HttpResponse.json(
+              { error: 'access_denied' },
+              { status: 401 },
+            )
+          }
+
+          pkceAuthenticated = true
+          return new HttpResponse(null, {
+            status: 204,
+            headers: {
+              'Set-Cookie': 'ring_session=test-session-authed; Path=/; Secure',
+            },
+          })
+        },
+      ),
+    )
+
+    client = new RingRestClient({ password, email })
+
+    await expect(client.getAuth()).resolves.toMatchObject({
+      access_token: accessToken,
+      refresh_token: await wrapRefreshToken(refreshToken),
+    })
+  })
+
   it('should reject OAuth redirects outside Ring origins', async () => {
     let externalRequestReceived = false
     server.use(
@@ -542,7 +597,8 @@ describe('getAuth', () => {
   })
 
   it('should never write OAuth credentials or session material to debug logs', async () => {
-    const messages: string[] = []
+    const messages: string[] = [],
+      invalidPassword = 'definitely-not-the-password'
     useLogger({
       logInfo: (...message) => messages.push(message.map(String).join(' ')),
       logError: (message) => messages.push(String(message)),
@@ -553,10 +609,14 @@ describe('getAuth', () => {
     await expect(() => client.getAuth()).rejects.toThrow()
     await client.getAuth(twoFactorAuthCode)
 
+    client = new RingRestClient({ password: invalidPassword, email })
+    await expect(() => client.getAuth()).rejects.toThrow()
+
     const output = messages.join('\n')
     for (const secret of [
       email,
       password,
+      invalidPassword,
       twoFactorAuthCode,
       csrfToken,
       authorizationCode,
