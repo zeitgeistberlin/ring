@@ -609,6 +609,7 @@ describe('getAuth', () => {
     await expect(() => client.getAuth()).rejects.toThrow()
     await client.getAuth(twoFactorAuthCode)
 
+    pkceAuthenticated = false
     client = new RingRestClient({ password: invalidPassword, email })
     await expect(() => client.getAuth()).rejects.toThrow()
 
