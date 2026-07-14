@@ -1,5 +1,11 @@
 # ring-client-api
 
+## 14.3.1
+
+### Patch Changes
+
+- [`dbb75cd`](https://github.com/dgreif/ring/commit/dbb75cd8febe1bb8922ed00772454723a9773653) - Replace the legacy password grant with OAuth authorization code and PKCE authentication while preserving refresh-token and 2FA compatibility.
+
 ## 14.3.0
 
 ### Minor Changes
