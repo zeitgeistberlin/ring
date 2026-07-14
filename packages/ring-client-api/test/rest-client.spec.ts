@@ -485,6 +485,27 @@ describe('getAuth', () => {
     )
   })
 
+  it('should honor the path scope of a CSRF cookie', async () => {
+    server.use(
+      http.get(
+        'https://oauth.ring.com/oauth/v2/signin',
+        () =>
+          new HttpResponse('<html></html>', {
+            headers: {
+              'Content-Type': 'text/html',
+              'Set-Cookie': `csrf-token=${csrfToken}; Path=/oauth/v2; Secure`,
+            },
+          }),
+      ),
+    )
+
+    client = new RingRestClient({ password, email })
+
+    await expect(() => client.getAuth()).rejects.toThrow(
+      'Your Ring account is configured to use 2-factor authentication',
+    )
+  })
+
   it('should complete PKCE when the account does not require 2fa', async () => {
     server.use(
       http.post(

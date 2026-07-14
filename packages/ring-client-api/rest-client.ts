@@ -419,7 +419,9 @@ export class RingRestClient {
       '_csrf',
       'XSRF-TOKEN',
     ])
-    for (const cookie of await cookieJar.getCookies(oauthBaseUrl)) {
+    for (const cookie of await cookieJar.getCookies(
+      `${oauthBaseUrl}/oauth/v2/signin`,
+    )) {
       if (csrfCookieNames.has(cookie.key) && cookie.value) {
         return cookie.value
       }
